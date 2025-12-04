@@ -1,5 +1,5 @@
 // FILE: server.js
-// Render-ready Epic JWT signer with JWKS.
+// Render-ready Epic JWT signer with JWKS
 // Requires env vars: PRIVATE_KEY (RSA PEM), optional KID, CLIENT_ID, AUDIENCE. PORT is provided by Render.
 
 import express from "express";
