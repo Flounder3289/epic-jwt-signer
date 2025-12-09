@@ -1,5 +1,5 @@
 // FILE: server.js
-// Render-ready Epic JWT signer with JWKS (adds jti + nbf, clamps exp)
+// Render-ready Epic JWT signer with JWKS (adds jti + nbf(now), clamps exp)
 
 import express from "express";
 import { createPrivateKey, createPublicKey, randomUUID } from "crypto";
@@ -58,8 +58,8 @@ app.post("/sign-jwt", async (req, res) => {
       .setIssuer(String(iss))
       .setSubject(String(sub))
       .setAudience(String(aud))
-      .setJti(randomUUID())  // unique assertion id (Epic expects this)
-      .setNotBefore(0)       // start now to avoid clock skew
+      .setJti(randomUUID())   // unique assertion id (Epic expects this)
+      .setNotBefore(now)      // FIXED: use current time, not epoch 0
       .setIssuedAt(now)
       .setExpirationTime(now + expSeconds) // ≤ 300s
       .sign(privateKey);
