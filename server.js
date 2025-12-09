@@ -1,76 +1,67 @@
 // FILE: server.js
-// Render-ready Epic JWT signer with JWKS
-// Requires env vars: PRIVATE_KEY (RSA PEM), optional KID, CLIENT_ID, AUDIENCE. PORT is provided by Render.
+// Render-ready Epic JWT signer with JWKS (adds jti + nbf, clamps exp)
 
 import express from "express";
-import { createPrivateKey, createPublicKey } from "crypto";
+import { createPrivateKey, createPublicKey, randomUUID } from "crypto";
 import { exportJWK, SignJWT, calculateJwkThumbprint } from "jose";
 
 const app = express();
 app.use(express.json({ limit: "64kb" }));
 
 // --- Environment ---
-const PRIVATE_KEY_PEM = process.env.PRIVATE_KEY;   // REQUIRED: full PEM with BEGIN/END lines
-const KID = process.env.KID || "";                 // optional
-const DEFAULT_CLIENT_ID = process.env.CLIENT_ID || ""; // optional default for iss/sub
-const DEFAULT_AUDIENCE = process.env.AUDIENCE || "";   // optional default for aud
-const PORT = process.env.PORT || 10000;
+const PRIVATE_KEY_PEM = process.env.PRIVATE_KEY;        // REQUIRED: PKCS#8 PEM including BEGIN/END lines
+const KID_ENV = process.env.KID || "";                  // optional override
+const DEFAULT_CLIENT_ID = process.env.CLIENT_ID || "";  // optional default for iss/sub
+const DEFAULT_AUDIENCE = process.env.AUDIENCE || "";    // optional default for aud
+const PORT = process.env.PORT || 3000;                  // Render sets PORT; default 3000
 
 // --- Key bootstrap ---
 if (!PRIVATE_KEY_PEM || !PRIVATE_KEY_PEM.includes("BEGIN")) {
-  throw new Error("PRIVATE_KEY must contain a valid RSA PRIVATE KEY PEM (with BEGIN/END lines).");
+  throw new Error("PRIVATE_KEY must contain a valid PKCS#8 PRIVATE KEY PEM (with BEGIN/END lines).");
 }
-
 let privateKey;
 try {
   privateKey = createPrivateKey(PRIVATE_KEY_PEM);
 } catch (e) {
   throw new Error(`Invalid PRIVATE_KEY PEM: ${e?.message || e}`);
 }
-
 const publicKey = createPublicKey(privateKey);
 const publicJwk = await exportJWK(publicKey);
-// Normalize for Epic
 publicJwk.kty = "RSA";
 publicJwk.use = "sig";
 publicJwk.alg = "RS256";
-publicJwk.kid = KID.trim() || await calculateJwkThumbprint(publicJwk, "SHA-256");
+publicJwk.kid = KID_ENV.trim() || (await calculateJwkThumbprint(publicJwk, "SHA-256"));
 
-// --- Helpers ---
+// --- Utils ---
 const jwksBody = { keys: [publicJwk] };
-const bad = (res, msg) => res.status(400).json({ error: msg }); // why: clear misconfig
+const bad = (res, msg) => res.status(400).json({ error: "bad_request", error_description: msg });
+const clampExpSeconds = (v) => Math.min(300, Math.max(60, Number.isFinite(+v) ? Math.floor(+v) : 180));
 
 // --- Routes ---
-// JWKS (GET + HEAD), support trailing slash
-const sendJwks = (_req, res) => res.type("application/json").status(200).send(jwksBody);
-app.get("/jwks", sendJwks);
-app.get("/jwks/", sendJwks);
+app.get("/jwks", (_req, res) => res.status(200).json(jwksBody));
+app.get("/jwks/", (_req, res) => res.status(200).json(jwksBody));
 app.head("/jwks", (_req, res) => res.status(200).end());
-app.head("/jwks/", (_req, res) => res.status(200).end());
-
-// Health
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
-// Sign client_assertion for Epic OAuth
 app.post("/sign-jwt", async (req, res) => {
   const iss = req.body?.iss ?? DEFAULT_CLIENT_ID;
   const sub = req.body?.sub ?? DEFAULT_CLIENT_ID;
   const aud = req.body?.aud ?? DEFAULT_AUDIENCE;
-  const expSeconds = Number(req.body?.expSeconds ?? 240);
+  const expSeconds = clampExpSeconds(req.body?.expSeconds);
 
   if (!iss || !sub || !aud) return bad(res, "iss, sub, aud required (or set CLIENT_ID/AUDIENCE envs).");
-  if (!Number.isFinite(expSeconds) || expSeconds <= 0 || expSeconds > 600)
-    return bad(res, "expSeconds must be 1..600.");
 
   try {
     const now = Math.floor(Date.now() / 1000);
     const jwt = await new SignJWT({})
       .setProtectedHeader({ alg: "RS256", kid: publicJwk.kid })
-      .setIssuer(iss)
-      .setSubject(sub)
-      .setAudience(aud)
+      .setIssuer(String(iss))
+      .setSubject(String(sub))
+      .setAudience(String(aud))
+      .setJti(randomUUID())  // unique assertion id (Epic expects this)
+      .setNotBefore(0)       // start now to avoid clock skew
       .setIssuedAt(now)
-      .setExpirationTime(now + expSeconds)
+      .setExpirationTime(now + expSeconds) // ≤ 300s
       .sign(privateKey);
 
     res.status(200).json({ jwt });
@@ -79,13 +70,12 @@ app.post("/sign-jwt", async (req, res) => {
   }
 });
 
-// Minimal request log (helps confirm Epic hits /jwks)
+// Minimal request log
 app.use((req, _res, next) => {
   if (req.path !== "/health") console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
-// --- Start ---
 app.listen(PORT, () => {
   console.log(`JWT signer listening on :${PORT}`);
   console.log(`JWKS ready at /jwks (kid=${publicJwk.kid})`);
